@@ -1,0 +1,5 @@
+[pydocstyle]
+match = (?!test_).*\.py
+ignore = D100,D104,D213,D406,D407
+add-ignore = D100,D104,D213,D406,D407
+
