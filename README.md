@@ -31,7 +31,22 @@ pip install -r requirements.txt
 python scan_photos.py
 ```
 
-Le script va scanner le répertoire `\\hal9001\Volume_1\photos` et afficher les résultats.
+Le script va scanner le répertoire `\\hal9001\Volume_1\photos` et sauvegarder les résultats dans le dossier `resultats_scan/`.
+
+### Formats de sauvegarde
+
+Les résultats sont sauvegardés dans **3 formats** :
+
+1. **JSON** (`photos_scan_YYYYMMDD_HHMMSS.json`) : Format lisible et structuré
+2. **CSV** (`photos_scan_YYYYMMDD_HHMMSS.csv`) : Format tableur (Excel, LibreOffice)
+3. **SQLite** (`photos_scan_YYYYMMDD_HHMMSS.db`) : Base de données pour faciliter les requêtes et la comparaison avec le catalogue Lightroom
+
+Chaque fichier contient :
+- Le répertoire de la photo
+- Le nom du fichier
+- La hauteur (en pixels)
+- La largeur (en pixels)
+- La date du scan (pour SQLite)
 
 ## Tests
 

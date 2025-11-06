@@ -1,10 +1,13 @@
 """Tests unitaires pour le module scan_photos."""
 
+import json
+import sqlite3
 import os
 import tempfile
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 import pytest
+import pandas as pd
 from PIL import Image
 
 from scan_photos import (
@@ -12,7 +15,10 @@ from scan_photos import (
     is_image_file,
     scan_directory,
     process_image_file,
-    scan_photos_directory
+    scan_photos_directory,
+    save_results_json,
+    save_results_csv,
+    save_results_sqlite
 )
 
 
@@ -211,4 +217,99 @@ def test_scan_photos_directory_with_failures(tmp_path: Path) -> None:
     # Seule l'image valide devrait être traitée
     assert len(result) >= 1
     assert result[0]['nom_fichier'] == "valid.jpg"
+
+
+def test_save_results_json(tmp_path: Path) -> None:
+    """Test save_results_json."""
+    results = [
+        {
+            'repertoire': 'test',
+            'nom_fichier': 'photo1.jpg',
+            'hauteur': 100,
+            'largeur': 200
+        },
+        {
+            'repertoire': 'test',
+            'nom_fichier': 'photo2.jpg',
+            'hauteur': 150,
+            'largeur': 250
+        }
+    ]
+    output_path = tmp_path / "test.json"
+    saved_path = save_results_json(results, output_path)
+
+    assert saved_path == output_path
+    assert output_path.exists()
+
+    with open(output_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    assert data['total_photos'] == 2
+    assert len(data['photos']) == 2
+    assert 'timestamp' in data
+
+
+def test_save_results_csv(tmp_path: Path) -> None:
+    """Test save_results_csv."""
+    results = [
+        {
+            'repertoire': 'test',
+            'nom_fichier': 'photo1.jpg',
+            'hauteur': 100,
+            'largeur': 200
+        }
+    ]
+    output_path = tmp_path / "test.csv"
+    saved_path = save_results_csv(results, output_path)
+
+    assert saved_path == output_path
+    assert output_path.exists()
+
+    df = pd.read_csv(output_path)
+    assert len(df) == 1
+    assert df.iloc[0]['nom_fichier'] == 'photo1.jpg'
+    assert df.iloc[0]['hauteur'] == 100
+
+
+def test_save_results_sqlite(tmp_path: Path) -> None:
+    """Test save_results_sqlite."""
+    results = [
+        {
+            'repertoire': 'test',
+            'nom_fichier': 'photo1.jpg',
+            'hauteur': 100,
+            'largeur': 200
+        },
+        {
+            'repertoire': 'test2',
+            'nom_fichier': 'photo2.jpg',
+            'hauteur': 150,
+            'largeur': 250
+        }
+    ]
+    output_path = tmp_path / "test.db"
+    saved_path = save_results_sqlite(results, output_path)
+
+    assert saved_path == output_path
+    assert output_path.exists()
+
+    conn = sqlite3.connect(output_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM photos")
+    count = cursor.fetchone()[0]
+    conn.close()
+
+    assert count == 2
+
+    conn = sqlite3.connect(output_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM photos WHERE nom_fichier = 'photo1.jpg'")
+    row = cursor.fetchone()
+    conn.close()
+
+    assert row is not None
+    assert row[1] == 'test'  # repertoire
+    assert row[2] == 'photo1.jpg'  # nom_fichier
+    assert row[3] == 100  # hauteur
+    assert row[4] == 200  # largeur
 

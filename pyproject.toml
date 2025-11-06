@@ -16,6 +16,7 @@ strict_equality = true
 module = [
     "PIL.*",
     "tqdm.*",
+    "pandas.*",
 ]
 ignore_missing_imports = true
 
