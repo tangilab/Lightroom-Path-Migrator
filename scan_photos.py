@@ -13,6 +13,7 @@ import os
 import pandas as pd
 from PIL import Image
 from tqdm import tqdm
+from dotenv import load_dotenv
 
 
 def get_image_dimensions(image_path: Path) -> Optional[Tuple[int, int]]:
@@ -310,9 +311,20 @@ def load_all_photos_from_sqlite(sqlite_path: Path) -> List[Dict[str, str | int]]
     ]
 
 
+def _load_photos_directory() -> str:
+    """Charge le répertoire de base des photos depuis le fichier .env.
+
+    Returns:
+        Chemin du répertoire de base des photos.
+
+    """
+    load_dotenv()
+    return os.getenv('PHOTOS_DIRECTORY', r'\\hal9001\Volume_1\photos')
+
+
 def main() -> None:
     """Fonction principale du script."""
-    photos_directory = r"\\hal9001\Volume_1\photos"
+    photos_directory = _load_photos_directory()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path("resultats_scan")
     output_dir.mkdir(exist_ok=True)
