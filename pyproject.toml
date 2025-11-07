@@ -17,6 +17,7 @@ module = [
     "PIL.*",
     "tqdm.*",
     "pandas.*",
+    "dotenv.*",
 ]
 ignore_missing_imports = true
 
@@ -25,4 +26,7 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+
+[tool.pydocstyle]
+ignore = ["D203", "D211"]
 

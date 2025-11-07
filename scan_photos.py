@@ -106,12 +106,16 @@ def process_image_file(
 
 
 def scan_photos_directory(
-    photos_directory: str | Path
+    photos_directory: str | Path,
+    sqlite_path: Path | None = None,
+    batch_size: int = 1000
 ) -> List[Dict[str, str | int]]:
     """Scanne un répertoire de photos et retourne les informations.
 
     Args:
         photos_directory: Chemin vers le répertoire de photos.
+        sqlite_path: Chemin vers la base SQLite pour sauvegarde par lots.
+        batch_size: Nombre de photos à traiter avant sauvegarde SQLite.
 
     Returns:
         Liste de dictionnaires contenant les informations de chaque photo.
@@ -129,11 +133,18 @@ def scan_photos_directory(
 
     results: List[Dict[str, str | int]] = []
     failed_files: List[Path] = []
+    total_saved = 0
 
     for file_path in tqdm(image_files, desc="Traitement des images"):
         file_info = process_image_file(file_path, base_path)
         if file_info is not None:
             results.append(file_info)
+
+            if sqlite_path and len(results) >= batch_size:
+                save_results_sqlite(results, sqlite_path, append=True)
+                total_saved += len(results)
+                print(f"\n✓ {len(results)} photos sauvegardées dans la BDD (total: {total_saved})")
+                results = []
         else:
             failed_files.append(file_path)
 
@@ -194,13 +205,15 @@ def save_results_csv(
 
 def save_results_sqlite(
     results: List[Dict[str, str | int]],
-    output_path: Path
+    output_path: Path,
+    append: bool = False
 ) -> Path:
     """Sauvegarde les résultats dans une base SQLite.
 
     Args:
         results: Liste des résultats à sauvegarder.
         output_path: Chemin du fichier de sortie.
+        append: Si True, ajoute les données à la base existante.
 
     Returns:
         Chemin du fichier créé.
@@ -222,55 +235,130 @@ def save_results_sqlite(
     ''')
 
     scan_date = datetime.now().isoformat()
-    for result in results:
-        cursor.execute('''
-            INSERT INTO photos (repertoire, nom_fichier, hauteur, largeur, scan_date)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (
+    data_to_insert = [
+        (
             result['repertoire'],
             result['nom_fichier'],
             result['hauteur'],
             result['largeur'],
             scan_date
-        ))
+        )
+        for result in results
+    ]
+
+    cursor.executemany('''
+        INSERT INTO photos (repertoire, nom_fichier, hauteur, largeur, scan_date)
+        VALUES (?, ?, ?, ?, ?)
+    ''', data_to_insert)
 
     conn.commit()
     conn.close()
     return output_path
 
 
+def get_total_photos_count(sqlite_path: Path) -> int:
+    """Récupère le nombre total de photos dans la base SQLite.
+
+    Args:
+        sqlite_path: Chemin vers la base SQLite.
+
+    Returns:
+        Nombre total de photos dans la base.
+
+    """
+    if not sqlite_path.exists():
+        return 0
+
+    conn = sqlite3.connect(sqlite_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM photos")
+    result = cursor.fetchone()
+    conn.close()
+    return int(result[0]) if result else 0
+
+
+def load_all_photos_from_sqlite(sqlite_path: Path) -> List[Dict[str, str | int]]:
+    """Charge toutes les photos depuis la base SQLite.
+
+    Args:
+        sqlite_path: Chemin vers la base SQLite.
+
+    Returns:
+        Liste de dictionnaires contenant toutes les photos.
+
+    """
+    if not sqlite_path.exists():
+        return []
+
+    conn = sqlite3.connect(sqlite_path)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT repertoire, nom_fichier, hauteur, largeur
+        FROM photos
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+
+    return [
+        {
+            'repertoire': row[0],
+            'nom_fichier': row[1],
+            'hauteur': row[2],
+            'largeur': row[3]
+        }
+        for row in rows
+    ]
+
+
 def main() -> None:
     """Fonction principale du script."""
     photos_directory = r"\\hal9001\Volume_1\photos"
-    results = scan_photos_directory(photos_directory)
-    print(f"\nTotal de photos traitées avec succès: {len(results)}")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path("resultats_scan")
+    output_dir.mkdir(exist_ok=True)
+
+    sqlite_path = output_dir / f"photos_scan_{timestamp}.db"
+
+    print("Sauvegarde par lots de 1000 photos dans la BDD SQLite")
+    print(f"Base SQLite: {sqlite_path}\n")
+
+    results = scan_photos_directory(
+        photos_directory,
+        sqlite_path=sqlite_path,
+        batch_size=1000
+    )
 
     if results:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = Path("resultats_scan")
-        output_dir.mkdir(exist_ok=True)
+        save_results_sqlite(results, sqlite_path, append=True)
+        print(f"\n✓ {len(results)} photos restantes sauvegardées dans la BDD")
+
+    total_in_db = get_total_photos_count(sqlite_path)
+
+    if total_in_db > 0:
+        all_photos = load_all_photos_from_sqlite(sqlite_path)
 
         json_path = save_results_json(
-            results,
+            all_photos,
             output_dir / f"photos_scan_{timestamp}.json"
         )
         csv_path = save_results_csv(
-            results,
+            all_photos,
             output_dir / f"photos_scan_{timestamp}.csv"
         )
-        sqlite_path = save_results_sqlite(
-            results,
-            output_dir / f"photos_scan_{timestamp}.db"
-        )
 
-        print("\nRésultats sauvegardés dans:")
+        print("\n" + "="*60)
+        print("RÉSUMÉ")
+        print("="*60)
+        print(f"Total de photos dans la BDD SQLite: {total_in_db}")
+        print(f"\nRésultats sauvegardés dans:")
         print(f"  - JSON: {json_path}")
         print(f"  - CSV: {csv_path}")
         print(f"  - SQLite: {sqlite_path}")
 
-        print("\nExemple de résultats (5 premiers):")
-        for i, result in enumerate(results[:5], 1):
-            print(f"{i}. {result}")
+        if all_photos:
+            print("\nExemple de résultats (5 premiers):")
+            for i, result in enumerate(all_photos[:5], 1):
+                print(f"{i}. {result}")
     else:
         print("\nAucun résultat à sauvegarder.")
 
