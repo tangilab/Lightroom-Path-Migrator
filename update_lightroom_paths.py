@@ -282,7 +282,7 @@ def _find_best_match_for_file(
 def find_matches(
     lightroom_files: List[LightroomFile],
     photos_by_filename: Dict[str, List[PhotoScan]],
-    base_path: str = r'\\hal9001\Volume_1\photos',
+    base_path: Optional[str] = None,
 ) -> List[MatchResult]:
     """Trouve les correspondances entre fichiers Lightroom et photos scannées.
 
@@ -290,11 +290,15 @@ def find_matches(
         lightroom_files: Liste des fichiers Lightroom.
         photos_by_filename: Dictionnaire des photos indexées par nom.
         base_path: Chemin de base pour les nouveaux répertoires.
+                   Si None, charge depuis le fichier .env.
 
     Returns:
         Liste des correspondances trouvées.
 
     """
+    if base_path is None:
+        base_path = _load_photos_directory()
+    
     matches: List[MatchResult] = []
 
     for lr_file in lightroom_files:
@@ -457,11 +461,50 @@ def _load_dry_run_mode() -> bool:
     return dry_run_str in ('true', '1', 'yes', 'on')
 
 
+def _load_photos_directory() -> str:
+    """Charge le répertoire de base des photos depuis le fichier .env.
+
+    Returns:
+        Chemin du répertoire de base des photos.
+
+    """
+    load_dotenv()
+    return os.getenv('PHOTOS_DIRECTORY', r'\\hal9001\Volume_1\photos')
+
+
+def _load_scan_db_filename() -> str:
+    """Charge le nom du fichier de base de données du scan depuis le fichier .env.
+
+    Returns:
+        Nom du fichier de base de données du scan.
+
+    """
+    load_dotenv()
+    return os.getenv('SCAN_DB_FILENAME', 'photos_scan_20251107_192045.db')
+
+
+def _load_catalog_filename() -> str:
+    """Charge le nom du fichier catalogue Lightroom depuis le fichier .env.
+
+    Returns:
+        Nom du fichier catalogue Lightroom.
+
+    """
+    load_dotenv()
+    return os.getenv('CATALOG_FILENAME', 'catalogue 2 - dès juin 2017-2-2-v12.lrcat')
+
+
 def main() -> None:
     """Fonction principale du script."""
     base_dir = Path(__file__).parent
-    scan_db = base_dir / 'resultats_scan' / 'photos_scan_20251107_192045.db'
-    catalog = base_dir / 'catalogue_lightroom' / 'catalogue 2 - dès juin 2017-2-2-v12.lrcat'
+    
+    # Charger les chemins depuis le fichier .env
+    scan_db_filename = _load_scan_db_filename()
+    catalog_filename = _load_catalog_filename()
+    photos_directory = _load_photos_directory()
+    
+    scan_db = base_dir / 'resultats_scan' / scan_db_filename
+    catalog = base_dir / 'catalogue_lightroom' / catalog_filename
 
     print("Chargement des données du scan...")
     photos_by_filename = load_scan_photos(scan_db)
@@ -472,7 +515,7 @@ def main() -> None:
     print(f"  {len(lightroom_files)} fichiers Lightroom chargés")
 
     print("Recherche des correspondances...")
-    matches = find_matches(lightroom_files, photos_by_filename)
+    matches = find_matches(lightroom_files, photos_by_filename, base_path=photos_directory)
     print(f"  {len(matches)} correspondances trouvées")
 
     dry_run_mode = _load_dry_run_mode()
