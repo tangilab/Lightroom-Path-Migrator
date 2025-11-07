@@ -321,22 +321,24 @@ def find_matches(
 
 def _group_matches_by_root(
     matches: List[MatchResult],
-) -> Dict[int, str]:
+) -> Tuple[Dict[int, str], Dict[int, int]]:
     """Group les correspondances par root_folder_id.
 
     Args:
         matches: Liste des correspondances.
 
     Returns:
-        Dictionnaire root_id -> nouveau chemin.
+        Tuple (dictionnaire root_id -> nouveau chemin, dictionnaire root_id -> nombre de matches).
 
     """
     updates_by_root: Dict[int, str] = {}
+    match_counts: Dict[int, int] = {}
     for match in matches:
         root_id = match.lightroom_file.root_folder_id
         if root_id not in updates_by_root:
             updates_by_root[root_id] = match.new_absolute_path
-    return updates_by_root
+        match_counts[root_id] = match_counts.get(root_id, 0) + 1
+    return updates_by_root, match_counts
 
 
 def _normalize_path_for_comparison(path: str) -> str:
@@ -362,7 +364,7 @@ def _update_single_root_folder(
     root_id: int,
     new_path: str,
     dry_run: bool,
-) -> Tuple[bool, bool]:
+) -> Tuple[bool, bool, bool]:
     """Met à jour un seul répertoire racine.
 
     Args:
@@ -372,7 +374,7 @@ def _update_single_root_folder(
         dry_run: Si True, ne fait que simuler.
 
     Returns:
-        Tuple (updated, skipped).
+        Tuple (updated, skipped, conflict).
 
     """
     cursor.execute(
@@ -388,24 +390,37 @@ def _update_single_root_folder(
         new_normalized = _normalize_path_for_comparison(new_path)
         
         if current_normalized == new_normalized:
-            return (False, True)
+            return (False, True, False)
 
-    # Le chemin est différent, on doit mettre à jour
+    # Vérifier si le nouveau chemin existe déjà pour un autre root_folder_id
+    cursor.execute(
+        'SELECT id_local FROM AgLibraryRootFolder WHERE absolutePath = ? AND id_local != ?',
+        (new_path, root_id)
+    )
+    existing = cursor.fetchone()
+    
+    if existing:
+        # Le chemin existe déjà pour un autre root_folder_id
+        # On ne peut pas mettre à jour à cause de la contrainte UNIQUE
+        return (False, False, True)
+
+    # Le chemin est différent et n'existe pas déjà, on peut mettre à jour
     if not dry_run:
         cursor.execute(
             'UPDATE AgLibraryRootFolder SET absolutePath = ? WHERE id_local = ?',
             (new_path, root_id)
         )
-        return (True, False)
+        return (True, False, False)
     
     # Mode dry_run : on simule la mise à jour
-    return (True, False)
+    return (True, False, False)
 
 
 def update_root_folders(
     catalog_path: Path,
     matches: List[MatchResult],
     dry_run: bool = False,
+    min_matches: int = 5,
 ) -> Dict[str, int]:
     """Met à jour les répertoires racine dans le catalogue Lightroom.
 
@@ -413,24 +428,32 @@ def update_root_folders(
         catalog_path: Chemin vers le catalogue Lightroom.
         matches: Liste des correspondances à appliquer.
         dry_run: Si True, ne fait que simuler les modifications.
+        min_matches: Nombre minimum de fichiers en commun requis pour mettre à jour.
 
     Returns:
         Dictionnaire avec les statistiques des mises à jour.
 
     """
     if not matches:
-        return {'updated': 0, 'skipped': 0}
+        return {'updated': 0, 'skipped': 0, 'conflicts': 0, 'rejected': 0}
 
-    updates_by_root = _group_matches_by_root(matches)
+    updates_by_root, match_counts = _group_matches_by_root(matches)
 
     conn = sqlite3.connect(str(catalog_path))
     cursor = conn.cursor()
 
     updated = 0
     skipped = 0
+    conflicts = 0
+    rejected = 0
 
     for root_id, new_path in updates_by_root.items():
-        was_updated, was_skipped = _update_single_root_folder(
+        # Vérifier si on a assez de matches pour ce root_folder_id
+        if match_counts.get(root_id, 0) < min_matches:
+            rejected += 1
+            continue
+
+        was_updated, was_skipped, has_conflict = _update_single_root_folder(
             cursor,
             root_id,
             new_path,
@@ -440,12 +463,14 @@ def update_root_folders(
             updated += 1
         elif was_skipped:
             skipped += 1
+        elif has_conflict:
+            conflicts += 1
 
     if not dry_run:
         conn.commit()
     conn.close()
 
-    return {'updated': updated, 'skipped': skipped}
+    return {'updated': updated, 'skipped': skipped, 'conflicts': conflicts, 'rejected': rejected}
 
 
 def _load_dry_run_mode() -> bool:
@@ -520,9 +545,13 @@ def main() -> None:
 
     dry_run_mode = _load_dry_run_mode()
     print(f"\nMise à jour des répertoires (mode {'DRY-RUN' if dry_run_mode else 'APPLICATION'})...")
-    stats = update_root_folders(catalog, matches, dry_run=dry_run_mode)
-    print(f"  {stats['updated']} répertoires à mettre à jour")
+    stats = update_root_folders(catalog, matches, dry_run=dry_run_mode, min_matches=5)
+    print(f"  {stats['updated']} répertoires mis à jour")
     print(f"  {stats['skipped']} répertoires déjà à jour")
+    if stats.get('conflicts', 0) > 0:
+        print(f"  ⚠️  {stats['conflicts']} conflits (chemin déjà utilisé par un autre root_folder)")
+    if stats.get('rejected', 0) > 0:
+        print(f"  ⚠️  {stats['rejected']} répertoires rejetés (moins de 5 fichiers en commun)")
 
     if dry_run_mode:
         print("\n⚠️  Mode DRY-RUN : aucune modification n'a été appliquée")
