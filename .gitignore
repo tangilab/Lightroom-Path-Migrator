@@ -3,5 +3,10 @@ __pycache__/
 .pytest_cache/
 .venv/
 .env
+.coverage
+htmlcov/
+*.pyc
+*.pyo
+*.pyd
 catalogue_lightroom/
 resultats_scan/
