@@ -458,11 +458,6 @@ def update_root_folders(
         Dictionnaire avec les statistiques des mises à jour.
 
     """
-    if not matches:
-        return {'updated': 0, 'skipped': 0, 'conflicts': 0, 'rejected': 0}
-
-    updates_by_root, match_counts = _group_matches_by_root(matches)
-
     conn = sqlite3.connect(str(catalog_path))
     cursor = conn.cursor()
 
@@ -470,6 +465,48 @@ def update_root_folders(
     skipped = 0
     conflicts = 0
     rejected = 0
+    no_matches = 0
+
+    if not matches:
+        # Compter tous les root_folders qui ne sont pas dans le nouveau chemin
+        cursor.execute('''
+            SELECT COUNT(DISTINCT rf.id_local)
+            FROM AgLibraryRootFolder rf
+            WHERE rf.absolutePath NOT LIKE ? || '%'
+        ''', (_load_photos_directory().replace('\\', '/'),))
+        result = cursor.fetchone()
+        no_matches = result[0] if result else 0
+        conn.close()
+        return {
+            'updated': 0,
+            'skipped': 0,
+            'conflicts': 0,
+            'rejected': 0,
+            'no_matches': no_matches
+        }
+
+    updates_by_root, match_counts = _group_matches_by_root(matches)
+    
+    # Compter les root_folders qui n'ont aucun match ET qui ont des fichiers
+    # ET qui ne sont pas dans le nouveau chemin
+    root_ids_with_matches = set(updates_by_root.keys())
+    photos_base_path = _load_photos_directory().replace('\\', '/')
+    
+    # Trouver tous les root_folders qui ont des fichiers et qui ne sont pas dans le nouveau chemin
+    cursor.execute('''
+        SELECT DISTINCT rf.id_local, rf.absolutePath
+        FROM AgLibraryRootFolder rf
+        JOIN AgLibraryFolder f ON rf.id_local = f.rootFolder
+        JOIN AgLibraryFile fl ON f.id_local = fl.folder
+        WHERE rf.absolutePath NOT LIKE ? || '%'
+    ''', (photos_base_path,))
+    
+    root_folders_with_files = cursor.fetchall()
+    
+    for root_id, root_path in root_folders_with_files:
+        # Ne compter que ceux qui n'ont pas de matches
+        if root_id not in root_ids_with_matches:
+            no_matches += 1
 
     for root_id, new_path in updates_by_root.items():
         # Compter le nombre total de fichiers dans ce root_folder
@@ -510,7 +547,13 @@ def update_root_folders(
         conn.commit()
     conn.close()
 
-    return {'updated': updated, 'skipped': skipped, 'conflicts': conflicts, 'rejected': rejected}
+    return {
+        'updated': updated,
+        'skipped': skipped,
+        'conflicts': conflicts,
+        'rejected': rejected,
+        'no_matches': no_matches
+    }
 
 
 def _load_dry_run_mode() -> bool:
@@ -592,6 +635,8 @@ def main() -> None:
         print(f"  ⚠️  {stats['conflicts']} conflits (chemin déjà utilisé par un autre root_folder)")
     if stats.get('rejected', 0) > 0:
         print(f"  ⚠️  {stats['rejected']} répertoires rejetés (moins de 5 fichiers en commun)")
+    if stats.get('no_matches', 0) > 0:
+        print(f"  ⚠️  {stats['no_matches']} répertoires sans correspondances trouvées")
 
     if dry_run_mode:
         print("\n⚠️  Mode DRY-RUN : aucune modification n'a été appliquée")
