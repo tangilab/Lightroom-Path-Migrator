@@ -4,6 +4,17 @@ Ce projet permet de :
 1. **Scanner un répertoire de photos** et stocker les informations de chaque fichier (répertoire, nom, hauteur, largeur)
 2. **Mettre à jour les répertoires obsolètes** du catalogue Lightroom avec les nouveaux répertoires basés sur les données du scan
 
+## ⚠️ Disclaimer
+
+**AVANT D'UTILISER CE PROGRAMME, LISEZ ATTENTIVEMENT CE QUI SUIT :**
+
+- **Le programme ne pourrait être tenu responsable d'éventuels dommages** causés à votre catalogue Lightroom ou à vos données
+- **Utilisez une copie du catalogue, pas l'original** : Faites toujours une sauvegarde complète de votre catalogue Lightroom avant toute modification
+- **Utilisez le mode dry-run en premier lieu** : Testez toujours avec `DRY_RUN_MODE=true` dans le fichier `.env` avant d'appliquer les modifications
+- **Testé sur Lightroom 2026** : Ce programme a été testé sur Adobe Lightroom 2026. La compatibilité avec d'autres versions n'est pas garantie
+
+**En utilisant ce programme, vous acceptez d'utiliser ce logiciel à vos propres risques.**
+
 ## Installation
 
 1. Créer un environnement virtuel :
