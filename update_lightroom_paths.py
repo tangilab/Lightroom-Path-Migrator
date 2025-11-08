@@ -6,7 +6,7 @@ par les nouveaux répertoires basés sur les données du scan des photos.
 
 import sqlite3
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import os
 from dotenv import load_dotenv
@@ -319,6 +319,30 @@ def find_matches(
     return matches
 
 
+def _count_total_files_in_root_folder(
+    cursor: sqlite3.Cursor,
+    root_id: int,
+) -> int:
+    """Compte le nombre total de fichiers dans un root_folder.
+
+    Args:
+        cursor: Curseur de base de données.
+        root_id: ID du root_folder.
+
+    Returns:
+        Nombre total de fichiers dans ce root_folder.
+
+    """
+    cursor.execute('''
+        SELECT COUNT(fl.id_local)
+        FROM AgLibraryFile fl
+        JOIN AgLibraryFolder f ON fl.folder = f.id_local
+        WHERE f.rootFolder = ?
+    ''', (root_id,))
+    result = cursor.fetchone()
+    return result[0] if result else 0
+
+
 def _group_matches_by_root(
     matches: List[MatchResult],
 ) -> Tuple[Dict[int, str], Dict[int, int]]:
@@ -448,10 +472,26 @@ def update_root_folders(
     rejected = 0
 
     for root_id, new_path in updates_by_root.items():
-        # Vérifier si on a assez de matches pour ce root_folder_id
-        if match_counts.get(root_id, 0) < min_matches:
-            rejected += 1
-            continue
+        # Compter le nombre total de fichiers dans ce root_folder
+        total_files = _count_total_files_in_root_folder(cursor, root_id)
+        match_count = match_counts.get(root_id, 0)
+        
+        # Si le répertoire a moins de min_matches fichiers au total,
+        # accepter seulement si toutes les photos correspondent
+        if total_files < min_matches:
+            if match_count == total_files:
+                # Toutes les images correspondent, on accepte
+                pass
+            else:
+                # Pas toutes les images correspondent, on rejette
+                rejected += 1
+                continue
+        else:
+            # Si le répertoire a min_matches fichiers ou plus,
+            # appliquer le seuil de min_matches normalement
+            if match_count < min_matches:
+                rejected += 1
+                continue
 
         was_updated, was_skipped, has_conflict = _update_single_root_folder(
             cursor,
