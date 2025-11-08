@@ -8,6 +8,7 @@ import sqlite3
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
+from collections import Counter
 import os
 from dotenv import load_dotenv
 
@@ -383,12 +384,105 @@ def _normalize_path_for_comparison(path: str) -> str:
     return normalized.lower()
 
 
+def _merge_root_folders(
+    cursor: sqlite3.Cursor,
+    source_root_id: int,
+    target_root_id: int,
+    dry_run: bool,
+) -> int:
+    """Fusionne les fichiers d'un root_folder vers un autre.
+
+    Pour chaque fichier du second root_folder, applique l'ID du premier
+    root_folder en trouvant le dossier correspondant (même pathFromRoot).
+
+    Args:
+        cursor: Curseur de base de données.
+        source_root_id: ID du root_folder source (à fusionner).
+        target_root_id: ID du root_folder cible (qui recevra les fichiers).
+        dry_run: Si True, ne fait que simuler.
+
+    Returns:
+        Nombre de fichiers fusionnés.
+
+    """
+    # Récupérer tous les fichiers du source avec leur dossier, pathFromRoot et lc_idx_filename
+    cursor.execute('''
+        SELECT fl.id_local, fl.folder, f.pathFromRoot, fl.lc_idx_filename
+        FROM AgLibraryFile fl
+        JOIN AgLibraryFolder f ON fl.folder = f.id_local
+        WHERE f.rootFolder = ?
+    ''', (source_root_id,))
+    source_files = cursor.fetchall()
+    
+    if not source_files:
+        return 0
+    
+    total_files_merged = 0
+    
+    if not dry_run:
+        for file_id, source_folder_id, path_from_root, lc_idx_filename in source_files:
+            # Trouver le dossier correspondant dans le target (même pathFromRoot)
+            cursor.execute('''
+                SELECT id_local
+                FROM AgLibraryFolder
+                WHERE rootFolder = ? AND pathFromRoot = ?
+            ''', (target_root_id, path_from_root))
+            target_folder = cursor.fetchone()
+            
+            if target_folder:
+                target_folder_id = target_folder[0]
+                
+                # Vérifier si un fichier avec le même lc_idx_filename existe déjà dans le dossier cible
+                cursor.execute('''
+                    SELECT id_local
+                    FROM AgLibraryFile
+                    WHERE folder = ? AND lc_idx_filename = ?
+                ''', (target_folder_id, lc_idx_filename))
+                existing_file = cursor.fetchone()
+                
+                if not existing_file:
+                    # Le fichier n'existe pas dans le dossier cible, on peut le fusionner
+                    cursor.execute('''
+                        UPDATE AgLibraryFile
+                        SET folder = ?
+                        WHERE id_local = ?
+                    ''', (target_folder_id, file_id))
+                    total_files_merged += 1
+                # Si le fichier existe déjà, on ignore (doublon)
+            # Si le dossier n'existe pas dans le target, on ignore le fichier
+    else:
+        # Mode dry_run : compter seulement les fichiers qui peuvent être fusionnés
+        for file_id, source_folder_id, path_from_root, lc_idx_filename in source_files:
+            cursor.execute('''
+                SELECT id_local
+                FROM AgLibraryFolder
+                WHERE rootFolder = ? AND pathFromRoot = ?
+            ''', (target_root_id, path_from_root))
+            target_folder = cursor.fetchone()
+            
+            if target_folder:
+                target_folder_id = target_folder[0]
+                
+                # Vérifier si un fichier avec le même lc_idx_filename existe déjà
+                cursor.execute('''
+                    SELECT id_local
+                    FROM AgLibraryFile
+                    WHERE folder = ? AND lc_idx_filename = ?
+                ''', (target_folder_id, lc_idx_filename))
+                existing_file = cursor.fetchone()
+                
+                if not existing_file:
+                    total_files_merged += 1
+    
+    return total_files_merged
+
+
 def _update_single_root_folder(
     cursor: sqlite3.Cursor,
     root_id: int,
     new_path: str,
     dry_run: bool,
-) -> Tuple[bool, bool, bool]:
+) -> Tuple[bool, bool, bool, int]:
     """Met à jour un seul répertoire racine.
 
     Args:
@@ -398,7 +492,7 @@ def _update_single_root_folder(
         dry_run: Si True, ne fait que simuler.
 
     Returns:
-        Tuple (updated, skipped, conflict).
+        Tuple (updated, skipped, conflict, merged_count).
 
     """
     cursor.execute(
@@ -414,7 +508,7 @@ def _update_single_root_folder(
         new_normalized = _normalize_path_for_comparison(new_path)
         
         if current_normalized == new_normalized:
-            return (False, True, False)
+            return (False, True, False, 0)
 
     # Vérifier si le nouveau chemin existe déjà pour un autre root_folder_id
     cursor.execute(
@@ -425,8 +519,12 @@ def _update_single_root_folder(
     
     if existing:
         # Le chemin existe déjà pour un autre root_folder_id
-        # On ne peut pas mettre à jour à cause de la contrainte UNIQUE
-        return (False, False, True)
+        # Fusionner les fichiers du second root_folder vers le premier
+        existing_root_id = existing[0]
+        merged_count = _merge_root_folders(cursor, root_id, existing_root_id, dry_run)
+        if merged_count > 0:
+            return (True, False, False, merged_count)  # Fusionné avec succès
+        return (False, False, True, 0)  # Conflit non résolu
 
     # Le chemin est différent et n'existe pas déjà, on peut mettre à jour
     if not dry_run:
@@ -434,10 +532,90 @@ def _update_single_root_folder(
             'UPDATE AgLibraryRootFolder SET absolutePath = ? WHERE id_local = ?',
             (new_path, root_id)
         )
-        return (True, False, False)
+        return (True, False, False, 0)
     
     # Mode dry_run : on simule la mise à jour
-    return (True, False, False)
+    return (True, False, False, 0)
+
+
+def _find_matches_by_filename_only(
+    catalog_path: Path,
+    root_id: int,
+    photos_by_filename: Dict[str, List[PhotoScan]],
+    photos_base_path: str
+) -> List[MatchResult]:
+    """Trouve des correspondances par nom de fichier uniquement pour un root_folder.
+
+    Args:
+        catalog_path: Chemin vers le catalogue Lightroom.
+        root_id: ID du root_folder à traiter.
+        photos_by_filename: Dictionnaire des photos indexées par nom.
+        photos_base_path: Chemin de base des photos.
+
+    Returns:
+        Liste des correspondances trouvées par nom uniquement.
+
+    """
+    conn = sqlite3.connect(str(catalog_path))
+    cursor = conn.cursor()
+    
+    # Récupérer tous les fichiers de ce root_folder
+    cursor.execute('''
+        SELECT
+            fl.id_local,
+            fl.baseName,
+            fl.extension,
+            fl.folder,
+            f.rootFolder,
+            rf.absolutePath,
+            f.pathFromRoot
+        FROM AgLibraryFile fl
+        JOIN AgLibraryFolder f ON fl.folder = f.id_local
+        JOIN AgLibraryRootFolder rf ON f.rootFolder = rf.id_local
+        WHERE rf.id_local = ?
+    ''', (root_id,))
+    
+    rows = cursor.fetchall()
+    conn.close()
+    
+    matches: List[MatchResult] = []
+    
+    for row in rows:
+        file_id, base_name, extension, folder_id, root_folder_id, old_path, path_from_root = row
+        
+        filename = f"{base_name}.{extension}"
+        if filename not in photos_by_filename:
+            continue
+        
+        # Prendre le premier candidat trouvé (par nom uniquement)
+        candidates = photos_by_filename[filename]
+        if not candidates:
+            continue
+        
+        # Utiliser le premier candidat trouvé
+        photo = candidates[0]
+        
+        lr_file = LightroomFile(
+            id_local=file_id,
+            base_name=base_name,
+            extension=extension,
+            folder_id=folder_id,
+            root_folder_id=root_folder_id,
+            old_absolute_path=old_path or '',
+            path_from_root=path_from_root or ''
+        )
+        
+        new_path = _build_new_path(photos_base_path, photo.repertoire)
+        
+        match = MatchResult(
+            lightroom_file=lr_file,
+            photo_scan=photo,
+            new_absolute_path=new_path,
+            confidence=0.5  # Score faible car correspondance par nom uniquement
+        )
+        matches.append(match)
+    
+    return matches
 
 
 def update_root_folders(
@@ -445,6 +623,8 @@ def update_root_folders(
     matches: List[MatchResult],
     dry_run: bool = False,
     min_matches: int = 5,
+    photos_by_filename: Optional[Dict[str, List[PhotoScan]]] = None,
+    photos_base_path: Optional[str] = None,
 ) -> Dict[str, int]:
     """Met à jour les répertoires racine dans le catalogue Lightroom.
 
@@ -453,6 +633,8 @@ def update_root_folders(
         matches: Liste des correspondances à appliquer.
         dry_run: Si True, ne fait que simuler les modifications.
         min_matches: Nombre minimum de fichiers en commun requis pour mettre à jour.
+        photos_by_filename: Dictionnaire des photos pour recherche par nom (optionnel).
+        photos_base_path: Chemin de base des photos pour recherche par nom (optionnel).
 
     Returns:
         Dictionnaire avec les statistiques des mises à jour.
@@ -466,6 +648,7 @@ def update_root_folders(
     conflicts = 0
     rejected = 0
     no_matches = 0
+    merged = 0
 
     if not matches:
         # Compter tous les root_folders qui ne sont pas dans le nouveau chemin
@@ -482,7 +665,8 @@ def update_root_folders(
             'skipped': 0,
             'conflicts': 0,
             'rejected': 0,
-            'no_matches': no_matches
+            'no_matches': no_matches,
+            'merged': 0
         }
 
     updates_by_root, match_counts = _group_matches_by_root(matches)
@@ -503,10 +687,76 @@ def update_root_folders(
     
     root_folders_with_files = cursor.fetchall()
     
+    # Traiter les root_folders sans matches : recherche par nom uniquement
+    root_ids_without_matches = []
     for root_id, root_path in root_folders_with_files:
-        # Ne compter que ceux qui n'ont pas de matches
         if root_id not in root_ids_with_matches:
+            root_ids_without_matches.append(root_id)
             no_matches += 1
+    
+    # Si on a les données nécessaires, essayer de trouver des matches par nom
+    if photos_by_filename and photos_base_path:
+        for root_id in root_ids_without_matches:
+            # Chercher des matches par nom uniquement
+            filename_matches = _find_matches_by_filename_only(
+                catalog_path,
+                root_id,
+                photos_by_filename,
+                photos_base_path
+            )
+            
+            if filename_matches:
+                # Grouper par root_folder et déterminer le chemin le plus fréquent
+                path_counts: Counter[str] = Counter()
+                
+                for match in filename_matches:
+                    if match.lightroom_file.root_folder_id == root_id:
+                        path_counts[match.new_absolute_path] += 1
+                
+                if path_counts:
+                    # Prendre le chemin le plus fréquent
+                    most_common_path, path_count = path_counts.most_common(1)[0]
+                    filename_match_count = path_count
+                    total_files = _count_total_files_in_root_folder(cursor, root_id)
+                    
+                    # Appliquer la même logique de validation
+                    if total_files < min_matches:
+                        if filename_match_count == total_files:
+                            # Toutes les images correspondent, on accepte
+                            was_updated, was_skipped, has_conflict, merged_count = _update_single_root_folder(
+                                cursor,
+                                root_id,
+                                most_common_path,
+                                dry_run
+                            )
+                            if was_updated:
+                                updated += 1
+                                merged += merged_count
+                                no_matches -= 1  # Retirer du compteur car maintenant traité
+                            elif was_skipped:
+                                skipped += 1
+                                no_matches -= 1
+                            elif has_conflict:
+                                conflicts += 1
+                                no_matches -= 1
+                    else:
+                        if filename_match_count >= min_matches:
+                            was_updated, was_skipped, has_conflict, merged_count = _update_single_root_folder(
+                                cursor,
+                                root_id,
+                                most_common_path,
+                                dry_run
+                            )
+                            if was_updated:
+                                updated += 1
+                                merged += merged_count
+                                no_matches -= 1
+                            elif was_skipped:
+                                skipped += 1
+                                no_matches -= 1
+                            elif has_conflict:
+                                conflicts += 1
+                                no_matches -= 1
 
     for root_id, new_path in updates_by_root.items():
         # Compter le nombre total de fichiers dans ce root_folder
@@ -530,7 +780,7 @@ def update_root_folders(
                 rejected += 1
                 continue
 
-        was_updated, was_skipped, has_conflict = _update_single_root_folder(
+        was_updated, was_skipped, has_conflict, merged_count = _update_single_root_folder(
             cursor,
             root_id,
             new_path,
@@ -538,6 +788,7 @@ def update_root_folders(
         )
         if was_updated:
             updated += 1
+            merged += merged_count
         elif was_skipped:
             skipped += 1
         elif has_conflict:
@@ -552,7 +803,8 @@ def update_root_folders(
         'skipped': skipped,
         'conflicts': conflicts,
         'rejected': rejected,
-        'no_matches': no_matches
+        'no_matches': no_matches,
+        'merged': merged
     }
 
 
@@ -628,7 +880,14 @@ def main() -> None:
 
     dry_run_mode = _load_dry_run_mode()
     print(f"\nMise à jour des répertoires (mode {'DRY-RUN' if dry_run_mode else 'APPLICATION'})...")
-    stats = update_root_folders(catalog, matches, dry_run=dry_run_mode, min_matches=5)
+    stats = update_root_folders(
+        catalog,
+        matches,
+        dry_run=dry_run_mode,
+        min_matches=5,
+        photos_by_filename=photos_by_filename,
+        photos_base_path=photos_directory
+    )
     print(f"  {stats['updated']} répertoires mis à jour")
     print(f"  {stats['skipped']} répertoires déjà à jour")
     if stats.get('conflicts', 0) > 0:
@@ -637,6 +896,8 @@ def main() -> None:
         print(f"  ⚠️  {stats['rejected']} répertoires rejetés (moins de 5 fichiers en commun)")
     if stats.get('no_matches', 0) > 0:
         print(f"  ⚠️  {stats['no_matches']} répertoires sans correspondances trouvées")
+    if stats.get('merged', 0) > 0:
+        print(f"  ✅ {stats['merged']} fichiers fusionnés vers d'autres root_folders")
 
     if dry_run_mode:
         print("\n⚠️  Mode DRY-RUN : aucune modification n'a été appliquée")
