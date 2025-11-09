@@ -618,6 +618,332 @@ def _find_matches_by_filename_only(
     return matches
 
 
+def _count_root_folders_without_matches(
+    cursor: sqlite3.Cursor,
+    photos_base_path: str,
+) -> int:
+    """Compte les root_folders qui ne sont pas dans le nouveau chemin.
+
+    Args:
+        cursor: Curseur de base de données.
+        photos_base_path: Chemin de base des photos.
+
+    Returns:
+        Nombre de root_folders sans matches.
+
+    """
+    cursor.execute('''
+        SELECT COUNT(DISTINCT rf.id_local)
+        FROM AgLibraryRootFolder rf
+        WHERE rf.absolutePath NOT LIKE ? || '%'
+    ''', (photos_base_path,))
+    result = cursor.fetchone()
+    return result[0] if result else 0
+
+
+def _find_root_folders_without_matches(
+    cursor: sqlite3.Cursor,
+    root_ids_with_matches: set,
+    photos_base_path: str,
+) -> List[int]:
+    """Trouve les root_folders sans matches qui ont des fichiers.
+
+    Args:
+        cursor: Curseur de base de données.
+        root_ids_with_matches: Ensemble des IDs de root_folders avec matches.
+        photos_base_path: Chemin de base des photos.
+
+    Returns:
+        Liste des IDs de root_folders sans matches.
+
+    """
+    cursor.execute('''
+        SELECT DISTINCT rf.id_local
+        FROM AgLibraryRootFolder rf
+        JOIN AgLibraryFolder f ON rf.id_local = f.rootFolder
+        JOIN AgLibraryFile fl ON f.id_local = fl.folder
+        WHERE rf.absolutePath NOT LIKE ? || '%'
+    ''', (photos_base_path,))
+    
+    root_folders_with_files = cursor.fetchall()
+    root_ids_without_matches = [
+        root_id for root_id, in root_folders_with_files
+        if root_id not in root_ids_with_matches
+    ]
+    
+    return root_ids_without_matches
+
+
+def _find_most_common_path_from_matches(
+    filename_matches: List[MatchResult],
+    root_id: int,
+) -> Optional[Tuple[str, int]]:
+    """Trouve le chemin le plus fréquent parmi les matches.
+
+    Args:
+        filename_matches: Liste des matches par nom de fichier.
+        root_id: ID du root_folder à traiter.
+
+    Returns:
+        Tuple (chemin le plus fréquent, nombre de matches) ou None.
+
+    """
+    path_counts: Counter[str] = Counter()
+    for match in filename_matches:
+        if match.lightroom_file.root_folder_id == root_id:
+            path_counts[match.new_absolute_path] += 1
+    
+    if not path_counts:
+        return None
+    
+    most_common_path, path_count = path_counts.most_common(1)[0]
+    return (most_common_path, path_count)
+
+
+def _process_single_root_folder_by_filename(
+    cursor: sqlite3.Cursor,
+    catalog_path: Path,
+    root_id: int,
+    photos_by_filename: Dict[str, List[PhotoScan]],
+    photos_base_path: str,
+    min_matches: int,
+    dry_run: bool,
+) -> Tuple[bool, bool, bool, int]:
+    """Traite un root_folder sans match avec recherche par nom.
+
+    Args:
+        cursor: Curseur de base de données.
+        catalog_path: Chemin vers le catalogue Lightroom.
+        root_id: ID du root_folder à traiter.
+        photos_by_filename: Dictionnaire des photos indexées par nom.
+        photos_base_path: Chemin de base des photos.
+        min_matches: Nombre minimum de matches requis.
+        dry_run: Si True, ne fait que simuler.
+
+    Returns:
+        Tuple (updated, skipped, conflict, merged_count).
+
+    """
+    filename_matches = _find_matches_by_filename_only(
+        catalog_path,
+        root_id,
+        photos_by_filename,
+        photos_base_path
+    )
+    
+    if not filename_matches:
+        return (False, False, False, 0)
+    
+    result = _find_most_common_path_from_matches(filename_matches, root_id)
+    if not result:
+        return (False, False, False, 0)
+    
+    most_common_path, filename_match_count = result
+    total_files = _count_total_files_in_root_folder(cursor, root_id)
+    
+    if not _validate_root_folder_update(
+        total_files,
+        filename_match_count,
+        min_matches
+    ):
+        return (False, False, False, 0)
+    
+    return _update_single_root_folder(
+        cursor,
+        root_id,
+        most_common_path,
+        dry_run
+    )
+
+
+def _update_stats_from_result(
+    stats: Dict[str, int],
+    was_updated: bool,
+    was_skipped: bool,
+    has_conflict: bool,
+    merged_count: int,
+) -> None:
+    """Met à jour les statistiques à partir d'un résultat.
+
+    Args:
+        stats: Dictionnaire de statistiques à mettre à jour.
+        was_updated: Si True, le root_folder a été mis à jour.
+        was_skipped: Si True, le root_folder a été ignoré.
+        has_conflict: Si True, il y a eu un conflit.
+        merged_count: Nombre de fichiers fusionnés.
+
+    """
+    if was_updated:
+        stats['updated'] += 1
+        stats['merged'] += merged_count
+        stats['no_matches'] -= 1
+    elif was_skipped:
+        stats['skipped'] += 1
+        stats['no_matches'] -= 1
+    elif has_conflict:
+        stats['conflicts'] += 1
+        stats['no_matches'] -= 1
+
+
+def _process_root_folders_without_matches(
+    cursor: sqlite3.Cursor,
+    catalog_path: Path,
+    root_ids_without_matches: List[int],
+    photos_by_filename: Optional[Dict[str, List[PhotoScan]]],
+    photos_base_path: Optional[str],
+    min_matches: int,
+    dry_run: bool,
+) -> Dict[str, int]:
+    """Traite les root_folders sans matches avec recherche par nom.
+
+    Args:
+        cursor: Curseur de base de données.
+        catalog_path: Chemin vers le catalogue Lightroom.
+        root_ids_without_matches: Liste des IDs de root_folders sans matches.
+        photos_by_filename: Dictionnaire des photos (optionnel).
+        photos_base_path: Chemin de base des photos (optionnel).
+        min_matches: Nombre minimum de matches requis.
+        dry_run: Si True, ne fait que simuler.
+
+    Returns:
+        Dictionnaire avec les statistiques (updated, skipped, conflicts,
+        merged, no_matches).
+
+    """
+    stats = {
+        'updated': 0,
+        'skipped': 0,
+        'conflicts': 0,
+        'merged': 0,
+        'no_matches': len(root_ids_without_matches)
+    }
+    
+    if not photos_by_filename or not photos_base_path:
+        return stats
+    
+    for root_id in root_ids_without_matches:
+        result = _process_single_root_folder_by_filename(
+            cursor,
+            catalog_path,
+            root_id,
+            photos_by_filename,
+            photos_base_path,
+            min_matches,
+            dry_run
+        )
+        
+        _update_stats_from_result(stats, *result)
+    
+    return stats
+
+
+def _validate_root_folder_update(
+    total_files: int,
+    match_count: int,
+    min_matches: int,
+) -> bool:
+    """Valide si un root_folder peut être mis à jour.
+
+    Args:
+        total_files: Nombre total de fichiers dans le root_folder.
+        match_count: Nombre de matches trouvés.
+        min_matches: Nombre minimum de matches requis.
+
+    Returns:
+        True si le root_folder peut être mis à jour, False sinon.
+
+    """
+    if total_files < min_matches:
+        # Si le répertoire a moins de min_matches fichiers,
+        # accepter seulement si toutes les photos correspondent
+        return match_count == total_files
+    
+    # Si le répertoire a min_matches fichiers ou plus,
+    # appliquer le seuil de min_matches normalement
+    return match_count >= min_matches
+
+
+def _process_root_folders_with_matches(
+    cursor: sqlite3.Cursor,
+    updates_by_root: Dict[int, str],
+    match_counts: Dict[int, int],
+    min_matches: int,
+    dry_run: bool,
+) -> Dict[str, int]:
+    """Traite les root_folders avec matches.
+
+    Args:
+        cursor: Curseur de base de données.
+        updates_by_root: Dictionnaire root_id -> nouveau chemin.
+        match_counts: Dictionnaire root_id -> nombre de matches.
+        min_matches: Nombre minimum de matches requis.
+        dry_run: Si True, ne fait que simuler.
+
+    Returns:
+        Dictionnaire avec les statistiques (updated, skipped, conflicts,
+        rejected, merged).
+
+    """
+    stats = {
+        'updated': 0,
+        'skipped': 0,
+        'conflicts': 0,
+        'rejected': 0,
+        'merged': 0
+    }
+    
+    for root_id, new_path in updates_by_root.items():
+        total_files = _count_total_files_in_root_folder(cursor, root_id)
+        match_count = match_counts.get(root_id, 0)
+        
+        if not _validate_root_folder_update(total_files, match_count, min_matches):
+            stats['rejected'] += 1
+            continue
+        
+        was_updated, was_skipped, has_conflict, merged_count = (
+            _update_single_root_folder(
+                cursor,
+                root_id,
+                new_path,
+                dry_run
+            )
+        )
+        
+        if was_updated:
+            stats['updated'] += 1
+            stats['merged'] += merged_count
+        elif was_skipped:
+            stats['skipped'] += 1
+        elif has_conflict:
+            stats['conflicts'] += 1
+    
+    return stats
+
+
+def _merge_update_stats(
+    stats_with_matches: Dict[str, int],
+    stats_no_matches: Dict[str, int],
+) -> Dict[str, int]:
+    """Fusionne les statistiques des mises à jour.
+
+    Args:
+        stats_with_matches: Statistiques des root_folders avec matches.
+        stats_no_matches: Statistiques des root_folders sans matches.
+
+    Returns:
+        Dictionnaire avec les statistiques fusionnées.
+
+    """
+    return {
+        'updated': stats_with_matches['updated'] + stats_no_matches['updated'],
+        'skipped': stats_with_matches['skipped'] + stats_no_matches['skipped'],
+        'conflicts': stats_with_matches['conflicts'] + stats_no_matches['conflicts'],
+        'rejected': stats_with_matches['rejected'],
+        'no_matches': stats_no_matches['no_matches'],
+        'merged': stats_with_matches['merged'] + stats_no_matches['merged']
+    }
+
+
 def update_root_folders(
     catalog_path: Path,
     matches: List[MatchResult],
@@ -642,23 +968,14 @@ def update_root_folders(
     """
     conn = sqlite3.connect(str(catalog_path))
     cursor = conn.cursor()
-
-    updated = 0
-    skipped = 0
-    conflicts = 0
-    rejected = 0
-    no_matches = 0
-    merged = 0
-
+    
+    photos_base_path_normalized = _load_photos_directory().replace('\\', '/')
+    
     if not matches:
-        # Compter tous les root_folders qui ne sont pas dans le nouveau chemin
-        cursor.execute('''
-            SELECT COUNT(DISTINCT rf.id_local)
-            FROM AgLibraryRootFolder rf
-            WHERE rf.absolutePath NOT LIKE ? || '%'
-        ''', (_load_photos_directory().replace('\\', '/'),))
-        result = cursor.fetchone()
-        no_matches = result[0] if result else 0
+        no_matches = _count_root_folders_without_matches(
+            cursor,
+            photos_base_path_normalized
+        )
         conn.close()
         return {
             'updated': 0,
@@ -668,144 +985,41 @@ def update_root_folders(
             'no_matches': no_matches,
             'merged': 0
         }
-
+    
     updates_by_root, match_counts = _group_matches_by_root(matches)
-    
-    # Compter les root_folders qui n'ont aucun match ET qui ont des fichiers
-    # ET qui ne sont pas dans le nouveau chemin
     root_ids_with_matches = set(updates_by_root.keys())
-    photos_base_path = _load_photos_directory().replace('\\', '/')
     
-    # Trouver tous les root_folders qui ont des fichiers et qui ne sont pas dans le nouveau chemin
-    cursor.execute('''
-        SELECT DISTINCT rf.id_local, rf.absolutePath
-        FROM AgLibraryRootFolder rf
-        JOIN AgLibraryFolder f ON rf.id_local = f.rootFolder
-        JOIN AgLibraryFile fl ON f.id_local = fl.folder
-        WHERE rf.absolutePath NOT LIKE ? || '%'
-    ''', (photos_base_path,))
+    root_ids_without_matches = _find_root_folders_without_matches(
+        cursor,
+        root_ids_with_matches,
+        photos_base_path_normalized
+    )
     
-    root_folders_with_files = cursor.fetchall()
+    stats_no_matches = _process_root_folders_without_matches(
+        cursor,
+        catalog_path,
+        root_ids_without_matches,
+        photos_by_filename,
+        photos_base_path or photos_base_path_normalized,
+        min_matches,
+        dry_run
+    )
     
-    # Traiter les root_folders sans matches : recherche par nom uniquement
-    root_ids_without_matches = []
-    for root_id, root_path in root_folders_with_files:
-        if root_id not in root_ids_with_matches:
-            root_ids_without_matches.append(root_id)
-            no_matches += 1
+    stats_with_matches = _process_root_folders_with_matches(
+        cursor,
+        updates_by_root,
+        match_counts,
+        min_matches,
+        dry_run
+    )
     
-    # Si on a les données nécessaires, essayer de trouver des matches par nom
-    if photos_by_filename and photos_base_path:
-        for root_id in root_ids_without_matches:
-            # Chercher des matches par nom uniquement
-            filename_matches = _find_matches_by_filename_only(
-                catalog_path,
-                root_id,
-                photos_by_filename,
-                photos_base_path
-            )
-            
-            if filename_matches:
-                # Grouper par root_folder et déterminer le chemin le plus fréquent
-                path_counts: Counter[str] = Counter()
-                
-                for match in filename_matches:
-                    if match.lightroom_file.root_folder_id == root_id:
-                        path_counts[match.new_absolute_path] += 1
-                
-                if path_counts:
-                    # Prendre le chemin le plus fréquent
-                    most_common_path, path_count = path_counts.most_common(1)[0]
-                    filename_match_count = path_count
-                    total_files = _count_total_files_in_root_folder(cursor, root_id)
-                    
-                    # Appliquer la même logique de validation
-                    if total_files < min_matches:
-                        if filename_match_count == total_files:
-                            # Toutes les images correspondent, on accepte
-                            was_updated, was_skipped, has_conflict, merged_count = _update_single_root_folder(
-                                cursor,
-                                root_id,
-                                most_common_path,
-                                dry_run
-                            )
-                            if was_updated:
-                                updated += 1
-                                merged += merged_count
-                                no_matches -= 1  # Retirer du compteur car maintenant traité
-                            elif was_skipped:
-                                skipped += 1
-                                no_matches -= 1
-                            elif has_conflict:
-                                conflicts += 1
-                                no_matches -= 1
-                    else:
-                        if filename_match_count >= min_matches:
-                            was_updated, was_skipped, has_conflict, merged_count = _update_single_root_folder(
-                                cursor,
-                                root_id,
-                                most_common_path,
-                                dry_run
-                            )
-                            if was_updated:
-                                updated += 1
-                                merged += merged_count
-                                no_matches -= 1
-                            elif was_skipped:
-                                skipped += 1
-                                no_matches -= 1
-                            elif has_conflict:
-                                conflicts += 1
-                                no_matches -= 1
-
-    for root_id, new_path in updates_by_root.items():
-        # Compter le nombre total de fichiers dans ce root_folder
-        total_files = _count_total_files_in_root_folder(cursor, root_id)
-        match_count = match_counts.get(root_id, 0)
-        
-        # Si le répertoire a moins de min_matches fichiers au total,
-        # accepter seulement si toutes les photos correspondent
-        if total_files < min_matches:
-            if match_count == total_files:
-                # Toutes les images correspondent, on accepte
-                pass
-            else:
-                # Pas toutes les images correspondent, on rejette
-                rejected += 1
-                continue
-        else:
-            # Si le répertoire a min_matches fichiers ou plus,
-            # appliquer le seuil de min_matches normalement
-            if match_count < min_matches:
-                rejected += 1
-                continue
-
-        was_updated, was_skipped, has_conflict, merged_count = _update_single_root_folder(
-            cursor,
-            root_id,
-            new_path,
-            dry_run
-        )
-        if was_updated:
-            updated += 1
-            merged += merged_count
-        elif was_skipped:
-            skipped += 1
-        elif has_conflict:
-            conflicts += 1
-
+    stats = _merge_update_stats(stats_with_matches, stats_no_matches)
+    
     if not dry_run:
         conn.commit()
     conn.close()
-
-    return {
-        'updated': updated,
-        'skipped': skipped,
-        'conflicts': conflicts,
-        'rejected': rejected,
-        'no_matches': no_matches,
-        'merged': merged
-    }
+    
+    return stats
 
 
 def _load_dry_run_mode() -> bool:

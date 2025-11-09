@@ -667,7 +667,24 @@ def test_update_root_folders_min_matches_rejection(
     temp_lightroom_catalog: Path,
 ) -> None:
     """Test de update_root_folders avec rejet si moins de 5 matches."""
+    # Ajouter 5 fichiers dans root_folder_id=1 pour le test
+    conn = sqlite3.connect(str(temp_lightroom_catalog))
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        INSERT INTO AgLibraryFile (id_local, id_global, baseName, extension, folder, idx_filename, lc_idx_filename, lc_idx_filenameExtension, originalFilename)
+        VALUES
+            (101, 'guid101', 'photo2', 'jpg', 10, 'photo2.jpg', 'photo2.jpg', 'photo2.jpg', 'photo2.jpg'),
+            (102, 'guid102', 'photo3', 'jpg', 10, 'photo3.jpg', 'photo3.jpg', 'photo3.jpg', 'photo3.jpg'),
+            (103, 'guid103', 'photo4', 'jpg', 10, 'photo4.jpg', 'photo4.jpg', 'photo4.jpg', 'photo4.jpg'),
+            (104, 'guid104', 'photo5', 'jpg', 10, 'photo5.jpg', 'photo5.jpg', 'photo5.jpg', 'photo5.jpg')
+    ''')
+    
+    conn.commit()
+    conn.close()
+    
     # Créer seulement 3 matches pour root_folder_id=1 (moins que le minimum de 5)
+    # Le root_folder a 5 fichiers, mais seulement 3 matches, donc il sera rejeté
     matches = [
         MatchResult(
             lightroom_file=LightroomFile(
@@ -687,10 +704,11 @@ def test_update_root_folders_min_matches_rejection(
             new_absolute_path=r'\\hal9001\Volume_1\photos\test\folder1' + '\\',
             confidence=0.8
         )
-        for i in range(3)  # Seulement 3 matches
+        for i in range(3)  # Seulement 3 matches sur 5 fichiers
     ]
     
     # Test avec min_matches=5 (par défaut)
+    # Le root_folder a 5 fichiers, mais seulement 3 matches, donc il sera rejeté
     stats = update_root_folders(
         temp_lightroom_catalog,
         matches,
@@ -702,7 +720,7 @@ def test_update_root_folders_min_matches_rejection(
     assert stats['skipped'] == 0
     assert stats['conflicts'] == 0
     
-    # Test avec min_matches=2 (devrait passer)
+    # Test avec min_matches=2 (devrait passer car 3 matches >= 2)
     stats = update_root_folders(
         temp_lightroom_catalog,
         matches,
